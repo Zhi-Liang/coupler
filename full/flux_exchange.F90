@@ -498,15 +498,13 @@ module flux_exchange_mod
        mpp_error, stderr, stdout, stdlog, FATAL, NOTE, mpp_set_current_pelist, &
        mpp_clock_id, mpp_clock_begin, mpp_clock_end, mpp_sum, mpp_max, &
        CLOCK_COMPONENT, CLOCK_SUBCOMPONENT, CLOCK_ROUTINE, lowercase, &
-       input_nml_file
+       input_nml_file, get_unit
                     
   use mpp_domains_mod, only: mpp_get_compute_domain, mpp_get_compute_domains, &
                              mpp_global_sum, mpp_redistribute, operator(.EQ.)
   use mpp_domains_mod, only: mpp_get_global_domain, mpp_get_data_domain
-  use mpp_domains_mod, only: mpp_set_global_domain, mpp_set_data_domain, mpp_set_compute_domain
-  use mpp_domains_mod, only: mpp_deallocate_domain, mpp_copy_domain, domain2d, mpp_compute_extent
+  use mpp_domains_mod, only: domain2d
 
-  use mpp_io_mod,      only: mpp_close, mpp_open, MPP_MULTI, MPP_SINGLE, MPP_OVERWR
 
 !model_boundary_data_type contains all model fields at the boundary.
 !model1_model2_boundary_type contains fields that model2 gets
@@ -531,8 +529,10 @@ module flux_exchange_mod
 !Balaji
 !utilities stuff into use fms_mod
   use fms_mod,                    only: clock_flag_default, check_nml_error, error_mesg
-  use fms_mod,                    only: open_namelist_file, write_version_number
-  use fms_mod,                    only: field_exist, field_size, read_data, get_mosaic_tile_grid
+  use fms_mod,                    only: write_version_number
+  use mosaic2_mod,                only: get_mosaic_tile_grid
+  use fms2_io_mod,                only: FmsNetcdfFile_t, open_file, variable_exists, close_file
+  use fms2_io_mod,                only: get_dimension_size, read_data
   use data_override_mod,          only: data_override
   use coupler_types_mod,          only: coupler_1d_bc_type
   use atmos_ocean_fluxes_mod,     only: atmos_ocean_fluxes_init, atmos_ocean_type_fluxes_init
@@ -748,17 +748,8 @@ contains
     logunit = stdlog()
     !----- read namelist -------
 
-#ifdef INTERNAL_FILE_NML
     read (input_nml_file, flux_exchange_nml, iostat=io)
     ierr = check_nml_error (io, 'flux_exchange_nml')
-#else
-    unit = open_namelist_file()
-    ierr=1; do while (ierr /= 0)
-    read  (unit, nml=flux_exchange_nml, iostat=io, end=10)
-    ierr = check_nml_error (io, 'flux_exchange_nml')
-    enddo
-10  call mpp_close(unit)
-#endif
 
     !----- write namelist to logfile -----
     call write_version_number (version, tag)
@@ -875,13 +866,14 @@ contains
     type(ice_data_type)          :: Ice
     type(ocean_state_type), pointer :: Ocn_state
 
-    integer :: i
+    integer :: i, io
 
     stocks_file=stdout()
     ! Divert output file for stocks if requested 
     if(mpp_pe()==mpp_root_pe() .and. divert_stocks_report) then
-       call mpp_open( stocks_file, 'stocks.out', action=MPP_OVERWR, threading=MPP_SINGLE, &
-            fileset=MPP_SINGLE, nohdrs=.TRUE. )       
+       stocks_file = get_unit()
+       open(stocks_file, file='stocks.out', action='WRITE', position='rewind', iostat=io)
+       if(io/=0) call mpp_error(FATAL, 'atm_land_ice_flux_exchange_mod:Error in opening file stocks.out')
     endif
 
     ! Initialize stock values
@@ -913,26 +905,30 @@ contains
     integer        :: isd, ied, jsd, jed
     integer        :: isc2, iec2, jsc2, jec2
     integer        :: nxg, nyg, ioff, joff
-    integer        :: nlon, nlat, siz(4)
-    integer        :: i, j
-    type(domain2d) :: domain2
+    integer        :: nlon, nlat
+    integer        :: i, j, start(2), nread(2)
     real, dimension(:,:), allocatable :: tmpx, tmpy
     real, dimension(:),   allocatable :: atmlonb, atmlatb
-    character(len=256)              :: atm_mosaic_file, tile_file
+    character(len=256)                :: atm_mosaic_file, tile_file
+    type(FmsNetcdfFile_t)             :: fileobj, mosaicfileobj, tilefileobj
 
     call mpp_get_global_domain(Atm%domain, isg, ieg, jsg, jeg, xsize=nxg, ysize=nyg)
     call mpp_get_compute_domain(Atm%domain, isc, iec, jsc, jec)
     call mpp_get_data_domain(Atm%domain, isd, ied, jsd, jed)
     if(size(Atm%lon_bnd,1) .NE. iec-isc+2 .OR. size(Atm%lon_bnd,2) .NE. jec-jsc+2) then
-       call error_mesg ('atm_land_ice_flux_exchange_mod',  &
+       call error_mesg ('flux_exchange_mod',  &
             'size of Atm%lon_bnd does not match the Atm computational domain', FATAL)
     endif
     ioff = lbound(Atm%lon_bnd,1) - isc
     joff = lbound(Atm%lon_bnd,2) - jsc
-    if(field_exist(grid_file, "AREA_ATM" ) ) then  ! old grid
-       call field_size(grid_file, "AREA_ATM", siz)
-       nlon = siz(1)
-       nlat = siz(2)
+
+    if(.not. open_file(fileobj, grid_file, 'read' )) then
+       call error_mesg('flux_exchange_mod', 'Error in opening file '//trim(grid_file), FATAL)
+    endif
+
+    if(variable_exists(fileobj, "AREA_ATM" ) ) then  ! old grid
+       call get_dimension_size(fileobj, "xta", nlon)
+       call get_dimension_size(fileobj, "yta", nlat)
 
        if (nlon /= nxg .or. nlat /= nyg) then
           if (mpp_pe()==mpp_root_pe()) then
@@ -940,19 +936,19 @@ contains
                   'atmosphere has', nxg, 'longitudes,', &
                   nyg, 'latitudes (see xba.dat and yba.dat)'
           end if
-          call error_mesg ('atm_land_ice_flux_exchange_mod',  &
+          call error_mesg ('flux_exchange_mod',  &
                'grid_spec.nc incompatible with atmosphere resolution', FATAL)
        end if
        allocate( atmlonb(isg:ieg+1) )
        allocate( atmlatb(jsg:jeg+1) )
-       call read_data(grid_file, 'xba', atmlonb, no_domain=.true. )
-       call read_data(grid_file, 'yba', atmlatb, no_domain=.true. )
+       call read_data(fileobj, 'xba', atmlonb)
+       call read_data(fileobj, 'yba', atmlatb)
 
        do i=isc, iec+1
           if(abs(atmlonb(i)-Atm%lon_bnd(i+ioff,jsc+joff)*45.0/atan(1.0))>bound_tol) then
              print *, 'GRID_SPEC/ATMOS LONGITUDE INCONSISTENCY at i= ',i, ': ', &
                   atmlonb(i),  Atm%lon_bnd(i+ioff,jsc+joff)*45.0/atan(1.0)
-             call error_mesg ('atm_land_ice_flux_exchange_mod', &
+             call error_mesg ('flux_exchange_mod', &
                   'grid_spec.nc incompatible with atmosphere longitudes (see xba.dat and yba.dat)'&
                   , FATAL)
           endif
@@ -961,17 +957,27 @@ contains
           if(abs(atmlatb(j)-Atm%lat_bnd(isc+ioff,j+joff)*45.0/atan(1.0))>bound_tol) then
              print *, 'GRID_SPEC/ATMOS LATITUDE INCONSISTENCY at j= ',j, ': ', &
                   atmlatb(j),  Atm%lat_bnd(isc+ioff, j+joff)*45.0/atan(1.0)
-             call error_mesg ('atm_land_ice_flux_exchange_mod', &
+             call error_mesg ('flux_exchange_mod', &
                   'grid_spec.nc incompatible with atmosphere latitudes (see xba.dat and yba.dat)'&
                   , FATAL)
           endif
        enddo
        deallocate(atmlonb, atmlatb)
-    else if(field_exist(grid_file, "atm_mosaic_file" ) ) then  ! mosaic grid file.
-       call read_data(grid_file, 'atm_mosaic_file', atm_mosaic_file)
-       call get_mosaic_tile_grid(tile_file, 'INPUT/'//trim(atm_mosaic_file), Atm%domain)
-       call field_size(tile_file, 'area', siz)
-       nlon = siz(1); nlat = siz(2)
+    else if(variable_exists(fileobj, "atm_mosaic_file" ) ) then  ! mosaic grid file.
+       call read_data(fileobj, 'atm_mosaic_file', atm_mosaic_file)
+       if(.not. open_file(mosaicfileobj,'INPUT/'//trim(atm_mosaic_file), "read")) then
+          call error_mesg('flux_exchange_mod', &
+                          'Error when opening solo mosaic file INPUT/'//trim(atm_mosaic_file), FATAL)
+       endif
+
+       call get_mosaic_tile_grid(tile_file, mosaicfileobj, Atm%domain)
+       if(.not. open_file(tilefileobj, tile_file, 'read') ) then
+          call error_mesg('flux_exchange_mod', 'Error in opening file '//trim(tile_file), FATAL)
+       endif
+
+       call get_dimension_size(tilefileobj, "nx", nlon)
+       call get_dimension_size(tilefileobj, "ny", nlat)
+
        if( mod(nlon,2) .NE. 0) call mpp_error(FATAL,  &
             'atm_land_ice_flux_exchange_mod: atmos supergrid longitude size can not be divided by 2')
        if( mod(nlat,2) .NE. 0) call mpp_error(FATAL,  &
@@ -983,47 +989,46 @@ contains
              print *, 'atmosphere mosaic tile has', nlon, 'longitudes,', nlat, 'latitudes; ', &
                   'atmosphere has', nxg, 'longitudes,', nyg, 'latitudes'
           end if
-          call error_mesg ('atm_land_ice_flux_exchange_mod',  &
+          call error_mesg ('flux_exchange_mod',  &
                'atmosphere mosaic tile grid file incompatible with atmosphere resolution', FATAL)
        end if
 
-       call mpp_copy_domain(Atm%domain, domain2)
-       call mpp_set_compute_domain(domain2, 2*isc-1, 2*iec+1, 2*jsc-1, 2*jec+1, 2*(iec-isc)+3, 2*(jec-jsc)+3 )
-       call mpp_set_data_domain   (domain2, 2*isd-1, 2*ied+1, 2*jsd-1, 2*jed+1, 2*(ied-isd)+3, 2*(jed-jsd)+3 )
-       call mpp_set_global_domain (domain2, 2*isg-1, 2*ieg+1, 2*jsg-1, 2*jeg+1, 2*(ieg-isg)+3, 2*(jeg-jsg)+3 )
-       call mpp_get_compute_domain(domain2, isc2, iec2, jsc2, jec2)
-       if(isc2 .NE. 2*isc-1 .OR. iec2 .NE. 2*iec+1 .OR. jsc2 .NE. 2*jsc-1 .OR. jec2 .NE. 2*jec+1) then
-          call mpp_error(FATAL, 'atm_land_ice_flux_exchange_mod: supergrid domain is not set properly')
-       endif
+       isc2 = 2*isc-1; iec2 = 2*iec+1
+       jsc2 = 2*jsc-1; jec2 = 2*jec+1
 
        allocate(tmpx(isc2:iec2,jsc2:jec2), tmpy(isc2:iec2,jsc2:jec2) )
 
-       call read_data( tile_file, 'x', tmpx, domain2)
-       call read_data( tile_file, 'y', tmpy, domain2)
-       call mpp_deallocate_domain(domain2)
+       start(1) = isc2; nread(1) = iec2-isc2+1
+       start(2) = jsc2; nread(2) = jec2-jsc2+1
+
+       call read_data( tilefileobj, 'x', tmpx, corner=start, edge_lengths=nread)
+       call read_data( tilefileobj, 'y', tmpy, corner=start, edge_lengths=nread)
 
        do j = jsc, jec+1
           do i = isc, iec+1
              if (abs(tmpx(2*i-1,2*j-1)-Atm%lon_bnd(i+ioff,j+joff)*45.0/atan(1.0))>bound_tol) then
                 print *, 'GRID_SPEC/ATMOS LONGITUDE INCONSISTENCY at i= ',i, ', j= ', j, ': ', &
                      tmpx(2*i-1,2*j-1),  Atm%lon_bnd(i+ioff,j+joff)*45.0/atan(1.0)
-                call error_mesg ('atm_land_ice_flux_exchange_mod', &
+                call error_mesg ('flux_exchange_mod', &
                      'grid_spec.nc incompatible with atmosphere longitudes (see '//trim(tile_file)//')'&
                      ,FATAL)
              end if
              if (abs(tmpy(2*i-1,2*j-1)-Atm%lat_bnd(i+ioff,j+joff)*45.0/atan(1.0))>bound_tol) then
                 print *, 'GRID_SPEC/ATMOS LATITUDE INCONSISTENCY at i= ',i, ', j= ', j, ': ', &
                      tmpy(2*i-1,2*j-1),  Atm%lat_bnd(i+ioff,j+joff)*45.0/atan(1.0)
-                call error_mesg ('atm_land_ice_flux_exchange_mod', &
+                call error_mesg ('flux_exchange_mod', &
                      'grid_spec.nc incompatible with atmosphere latitudes (see '//trim(tile_file)//')'&
                      ,FATAL)
              end if
           end do
        end do
        deallocate(tmpx, tmpy)
+       call close_file(tilefileobj)
+       call close_file(mosaicfileobj)
     else
        call mpp_error(FATAL, 'atm_land_ice_flux_exchange_mod: both AREA_ATMxOCN and ocn_mosaic_file does not exist in '//trim(grid_file))
     end if
+    call close_file(fileobj)
 
   end subroutine check_atm_grid
 

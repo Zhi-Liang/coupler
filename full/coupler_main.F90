@@ -321,13 +321,12 @@ program coupler_main
   use time_manager_mod,        only: date_to_string, increment_date
   use time_manager_mod,        only: operator(>=), operator(<=), operator(==)
 
-  use fms_mod,                 only: open_namelist_file, field_exist, file_exist, check_nml_error
+  use fms_mod,                 only: check_nml_error
   use fms_mod,                 only: uppercase, error_mesg, write_version_number
   use fms_mod,                 only: fms_init, fms_end, stdout
-  use fms_mod,                 only: read_data, write_data
 
   use fms_io_mod,              only: fms_io_exit
-  use fms_io_mod,              only: restart_file_type, register_restart_field
+  use fms_io_mod,              only: restart_file_type
   use fms_io_mod,              only: save_restart, restore_state
 
   use diag_manager_mod,        only: diag_manager_init, diag_manager_end, diag_grid_end
@@ -407,10 +406,11 @@ program coupler_main
   use mpp_mod,                 only: mpp_init, mpp_pe, mpp_npes, mpp_root_pe, mpp_sync
   use mpp_mod,                 only: stderr, stdlog, mpp_error, NOTE, FATAL, WARNING
   use mpp_mod,                 only: mpp_set_current_pelist, mpp_declare_pelist
-  use mpp_mod,                 only: input_nml_file
+  use mpp_mod,                 only: input_nml_file, get_unit
 
-  use mpp_io_mod,              only: mpp_open, mpp_close, mpp_io_clock_on
-  use mpp_io_mod,              only: MPP_NATIVE, MPP_RDONLY, MPP_DELETE
+  use fms2_io_mod,             only: file_exists, open_file, write_restart
+  use fms2_io_mod,             only: read_restart, open_file, close_file
+  use mpp_io_mod,              only: mpp_io_clock_on
 
   use mpp_domains_mod,         only: mpp_broadcast_domain
 
@@ -1226,17 +1226,8 @@ contains
 
 !----- read namelist -------
 
-#ifdef INTERNAL_FILE_NML
     read (input_nml_file, coupler_nml, iostat=io)
     ierr = check_nml_error (io, 'coupler_nml')
-#else
-    unit = open_namelist_file()
-    ierr=1; do while (ierr /= 0)
-      read (unit, nml=coupler_nml, iostat=io, end=10)
-      ierr = check_nml_error (io, 'coupler_nml')
-    enddo
-10  call mpp_close(unit)
-#endif
 
 !---- when concurrent is set true and mpp_io_nml io_clock_on is set true, the model
 !---- will crash with error message "MPP_CLOCK_BEGIN: cannot change pelist context of a clock",
@@ -1255,19 +1246,24 @@ contains
 
 !----- read date and calendar type from restart file -----
 
-    if (file_exist('INPUT/coupler.res')) then
-!Balaji: currently written in binary, needs form=MPP_NATIVE
-      call mpp_open( unit, 'INPUT/coupler.res', action=MPP_RDONLY )
+    if (file_exists('INPUT/coupler.res')) then
+      unit = get_unit()
+      open(unit, file='INPUT/coupler.res', action='READ', iostat=io)
+      if(io/=0) call error_mesg( 'program coupler', 'Error in opening file INPUT/coupler.res', FATAL)
       read( unit,*,err=999 )calendar_type
       read( unit,* )date_init
       read( unit,* )date
       goto 998 !back to fortran-4
 !read old-style coupler.res
-999   call mpp_close(unit)
-      call mpp_open( unit, 'INPUT/coupler.res', action=MPP_RDONLY, form=MPP_NATIVE )
+999   close(unit, iostat=io )
+      if(io/=0) call error_mesg( 'program coupler', 'Error in closing file INPUT/coupler.res', FATAL)
+      unit = get_unit()
+      open(unit, file='INPUT/coupler.res', action='READ', iostat=io)
+      if(io/=0) call error_mesg( 'program coupler', 'Error in second opening file INPUT/coupler.res', FATAL)
       read(unit)calendar_type
       read(unit)date
-998   call mpp_close(unit)
+998   close(unit, iostat=io )
+      if(io/=0) call error_mesg( 'program coupler', 'Error in second closing file INPUT/coupler.res', FATAL)
     else
       force_date_from_namelist = .true.
     endif
@@ -1678,10 +1674,13 @@ contains
     Run_length = Time_end - Time
 
 !--- get the time that last intermediate restart file was written out.
-    if (file_exist('INPUT/coupler.intermediate.res')) then
-       call mpp_open(unit,'INPUT/coupler.intermediate.res',action=MPP_RDONLY)
+    if (file_exists('INPUT/coupler.intermediate.res')) then
+       unit = get_unit()
+       open(unit, file='INPUT/coupler.intermediate.res', action='READ', iostat=io)
+       if(io/=0) call error_mesg( 'program coupler', 'Error in opening file INPUT/coupler.intermediate.res', FATAL)
        read(unit,*) date_restart
-       call mpp_close(unit)
+       close(unit, iostat=io )
+       if(io/=0) call error_mesg( 'program coupler', 'Error in closing file INPUT/coupler.intermediate.res', FATAL)
     else
        date_restart = date
     endif
@@ -1700,8 +1699,11 @@ contains
 
 !-----------------------------------------------------------------------
 !----- write time stamps (for start time and end time) ------
-
-    call mpp_open( unit, 'time_stamp.out', nohdrs=.TRUE. )
+    if(mpp_pe().EQ.mpp_root_pe() ) then
+       unit = get_unit()
+       open(unit, file='time_stamp.out', action='WRITE', position='rewind', iostat=io)
+       if(io/=0) call error_mesg( 'program coupler', 'Error in opening file time_stamp.out', FATAL)
+    endif
 
     month = month_name(date(2))
     if ( mpp_pe().EQ.mpp_root_pe() ) write (unit,20) date, month(1:3)
@@ -1709,9 +1711,11 @@ contains
     call get_date (Time_end, date(1), date(2), date(3),  &
                    date(4), date(5), date(6))
     month = month_name(date(2))
-    if ( mpp_pe().EQ.mpp_root_pe() ) write (unit,20) date, month(1:3)
-
-    call mpp_close(unit)
+    if ( mpp_pe().EQ.mpp_root_pe() ) then
+       write (unit,20) date, month(1:3)
+       close(unit, iostat=io )
+       if(io/=0) call error_mesg( 'program coupler', 'Error in closing file time_stamp.out', FATAL)
+    endif
 
 20  format (i6,5i4,2x,a3)
 
@@ -2001,7 +2005,7 @@ contains
 
     if ( Ocean%is_ocean_pe ) then
       call mpp_set_current_pelist(Ocean%pelist)
-
+      
       call coupler_type_register_restarts(Ocean%fields, Ocn_bc_restart, &
                num_ocn_bc_restart, Ocean%domain, ocean_restart=.true.)
 
@@ -2020,9 +2024,14 @@ contains
 
 !-----------------------------------------------------------------------
 !---- open and close dummy file in restart dir to check if dir exists --
+    if(mpp_pe() .EQ. mpp_root_pe()) then
+       unit = get_unit()
+       open(unit, file='RESTART/file', action='WRITE', iostat=io)
+       if(io/=0) call error_mesg( 'program coupler', 'Error in opening file RESTART/file', FATAL)
+       close(unit, status='DELETE', iostat=io)
+       if(io/=0) call error_mesg( 'program coupler', 'Error in closing file RESTART/file', FATAL)
+    endif
 
-    call mpp_open( unit, 'RESTART/file' )
-    call mpp_close(unit, MPP_DELETE)
 
     ! Call to daig_grid_end to free up memory used during regional
     ! output setup
@@ -2124,7 +2133,7 @@ contains
     type(time_type),   intent(in)           :: Time_run, Time_res
     character(len=*), intent(in),  optional :: time_stamp
     character(len=128)                      :: file_run, file_res
-    integer :: yr, mon, day, hr, min, sec, date(6), unit, n
+    integer :: yr, mon, day, hr, min, sec, date(6), unit, n, io
 
     call mpp_set_current_pelist()
 
@@ -2140,8 +2149,10 @@ contains
     !----- compute current date ------
     call get_date (Time_run, date(1), date(2), date(3),  &
                    date(4), date(5), date(6))
-    call mpp_open( unit, file_run, nohdrs=.TRUE. )
-    if ( mpp_pe().EQ.mpp_root_pe()) then
+    if(mpp_pe().EQ.mpp_root_pe() ) then
+       unit = get_unit()
+       open(unit, file=file_run, action='WRITE', position='rewind', iostat=io)
+       if(io/=0) call error_mesg( 'program coupler', 'Error in opening file '//trim(file_run), FATAL)
        write( unit, '(i6,8x,a)' )calendar_type, &
             '(Calendar: no_calendar=0, thirty_day_months=1, julian=2, gregorian=3, noleap=4)'
 
@@ -2149,17 +2160,21 @@ contains
             'Model start time:   year, month, day, hour, minute, second'
        write( unit, '(6i6,8x,a)' )date, &
             'Current model time: year, month, day, hour, minute, second'
+       close(unit, iostat=io)
+       if(io/=0) call error_mesg( 'program coupler', 'Error in closing file '//trim(file_run), FATAL)       
     endif
-    call mpp_close(unit)
 
     if (Time_res > Time_start) then
-      call mpp_open( unit, file_res, nohdrs=.TRUE. )
       if ( mpp_pe().EQ.mpp_root_pe()) then
+        unit = get_unit()
+        open(unit, file=file_res, action='WRITE', position='rewind', iostat=io)
+        if(io/=0) call error_mesg( 'program coupler', 'Error in opening file '//trim(file_res), FATAL)
         call get_date(Time_res ,yr,mon,day,hr,min,sec)
         write( unit, '(6i6,8x,a)' )yr,mon,day,hr,min,sec, &
              'Current intermediate restart time: year, month, day, hour, minute, second'
+        close(unit, iostat=io)
+        if(io/=0) call error_mesg( 'program coupler', 'Error in closing file '//trim(file_res), FATAL)   
       endif
-      call mpp_close(unit)
     endif
 
     if (Ocean%is_ocean_pe) then
